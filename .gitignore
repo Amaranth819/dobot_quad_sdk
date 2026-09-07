@@ -13,3 +13,7 @@
 **/*.egg-info/
 
 **/.cache
+
+.vscode/
+
+low_level/cpp/build/

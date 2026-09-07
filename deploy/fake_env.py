@@ -1,15 +1,27 @@
+"""Build MS-PPO observations from Dobot LowerState feedback."""
 
-
+import copy
 import time
 
-import lcm
 import numpy as np
 import torch
-# import cv2
 
-from go2_gym_deploy.lcm_types.pd_tau_targets_lcmt import pd_tau_targets_lcmt
 
-lc = lcm.LCM("udpm://239.255.76.67:7667?ttl=255")
+# FL, FR, RL, RR; abad, thigh, calf within each leg.
+ABS2HW = np.array([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14])
+MOTOR_OFFSET = np.array([
+    -0.05, -0.5, 1.17, 0.0,
+    0.05, -0.5, 1.17, 0.0,
+    -0.05, 0.5, -1.17, 0.0,
+    0.05, 0.5, -1.17, 0.0,
+], dtype=np.float32)
+# Logical K4 standing pose from the RegRep checkpoint's training configuration.
+DEFAULT_JOINT_POS = np.array([
+    0.1, 0.7, -1.5, 0.0,
+    -0.1, 0.7, -1.5, 0.0,
+    0.1, -0.7, 1.5, 0.0,
+    -0.1, -0.7, 1.5, 0.0,
+], dtype=np.float32)
 
 
 def class_to_dict(obj) -> dict:
@@ -30,53 +42,73 @@ def class_to_dict(obj) -> dict:
     return result
 
 
-class LCMAgent():
-    def __init__(self, cfg, se, command_profile):
+class FakeEnvAgent:
+    """One robot with 58 observations in the MS-PPO training layout.
+
+    Register ``lower_state_callback`` with
+    ``middleware.subscribeLowerState("rt/lower/state", env.lower_state_callback)``.
+    Alternatively, ``se`` may supply projected gravity and the twelve already
+    offset-corrected joint positions/velocities in FL, FR, RL, RR order.
+    An MS-PPO command profile supplies [vx, vy, yaw_rate, ...]; without a profile,
+    use ``set_commands``. Reading observations does not advance policy time.
+    For actions, pass a DDS ``middleware`` whose ``rt/lower/cmd`` writer has
+    already been created. Policy actions have 12 entries; motor commands have 16.
+    """
+
+    def __init__(self, cfg, se=None, command_profile=None, middleware=None):
         if not isinstance(cfg, dict):
             cfg = class_to_dict(cfg)
-        self.cfg = cfg
+        self.cfg = copy.deepcopy(cfg)
         self.se = se
         self.command_profile = command_profile
+        self.middleware = middleware
 
         self.dt = self.cfg["control"]["decimation"] * self.cfg["sim"]["dt"]
+        self.cfg["control"].setdefault("action_scale", 0.25)
+        self.cfg["control"].setdefault("hip_scale_reduction", 0.5)
         self.timestep = 0
+        self.time = time.time()
 
-        self.num_obs = self.cfg["env"]["num_observations"]
+        self.num_obs = 58
         self.num_envs = 1
-        self.num_privileged_obs = self.cfg["env"]["num_privileged_obs"]
-        self.num_actions = self.cfg["env"]["num_actions"]
-        self.num_commands = self.cfg["commands"]["num_commands"]
+        self.num_privileged_obs = 2
+        self.num_actions = 12
+        self.num_motors = 16
+        self.num_commands = 3
         self.device = 'cpu'
 
-        if "obs_scales" in self.cfg.keys():
-            self.obs_scales = self.cfg["obs_scales"]
-        else:
-            self.obs_scales = self.cfg["normalization"]["obs_scales"]
+        env_cfg = self.cfg.setdefault("env", {})
+        env_cfg.update(
+            num_observations=58, num_scalar_observations=58,
+            num_privileged_obs=2, num_actions=12,
+            observe_command=True, observe_two_prev_actions=True,
+            observe_clock_inputs=True, observe_timing_parameter=False,
+            observe_vel=False, observe_only_lin_vel=False,
+            observe_only_ang_vel=False, observe_yaw=False, observe_contact_states=False,
+        )
+        env_cfg.setdefault("num_observation_history", 30)
 
-        self.commands_scale = np.array(
-            [self.obs_scales["lin_vel"], self.obs_scales["lin_vel"],
-             self.obs_scales["ang_vel"], self.obs_scales["body_height_cmd"], 1, 1, 1, 1, 1,
-             self.obs_scales["footswing_height_cmd"], self.obs_scales["body_pitch_cmd"],
-             # 0, self.obs_scales["body_pitch_cmd"],
-             self.obs_scales["body_roll_cmd"], self.obs_scales["stance_width_cmd"],
-             self.obs_scales["stance_length_cmd"], self.obs_scales["aux_reward_cmd"], 1, 1, 1, 1, 1, 1
-             ])[:self.num_commands]
-
+        # Effective observation scales and clipping from MS-PPO scripts/train.py.
+        self.obs_scales = dict(lin_vel=2.0, ang_vel=0.25, dof_pos=1.0, dof_vel=0.05)
+        self.cfg.setdefault("obs_scales", {}).update(self.obs_scales)
+        self.cfg.setdefault("normalization", {}).update(clip_actions=10.0, clip_observations=100.0)
+        self.commands_scale = np.array([2.0, 2.0, 0.25], dtype=np.float32)
+        command_cfg = self.cfg.setdefault("commands", {})
+        command_cfg["num_commands"] = self.num_commands
+        self.cmd_indices = list(command_cfg.get("cmd_indices", [0, 1, 2]))
+        if sorted(self.cmd_indices) != [0, 1, 2]:
+            raise ValueError("commands.cmd_indices must be a permutation of [0, 1, 2]")
+        command_cfg["cmd_indices"] = self.cmd_indices
 
         joint_names = [
-            "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
-            "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
-            "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
-            "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint", ]
-        self.default_dof_pos = np.array([self.cfg["init_state"]["default_joint_angles"][name] for name in joint_names])
-        try:
-            self.default_dof_pos_scale = np.array([self.cfg["init_state"]["default_hip_scales"], self.cfg["init_state"]["default_thigh_scales"], self.cfg["init_state"]["default_calf_scales"],
-                                                   self.cfg["init_state"]["default_hip_scales"], self.cfg["init_state"]["default_thigh_scales"], self.cfg["init_state"]["default_calf_scales"],
-                                                   self.cfg["init_state"]["default_hip_scales"], self.cfg["init_state"]["default_thigh_scales"], self.cfg["init_state"]["default_calf_scales"],
-                                                   self.cfg["init_state"]["default_hip_scales"], self.cfg["init_state"]["default_thigh_scales"], self.cfg["init_state"]["default_calf_scales"]])
-        except KeyError:
-            self.default_dof_pos_scale = np.ones(12)
-        self.default_dof_pos = self.default_dof_pos * self.default_dof_pos_scale
+            f"joint_{leg}_{joint}"
+            for leg in ("front_left", "front_right", "rear_left", "rear_right")
+            for joint in ("abad", "thigh_pitch", "calf_pitch")
+        ]
+        self.default_dof_pos = DEFAULT_JOINT_POS[ABS2HW].copy()
+        self.cfg.setdefault("init_state", {})["default_joint_angles"] = dict(
+            zip(joint_names, self.default_dof_pos.tolist())
+        )
 
         self.p_gains = np.zeros(12)
         self.d_gains = np.zeros(12)
@@ -94,198 +126,223 @@ class LCMAgent():
                 if self.cfg["control"]["control_type"] in ["P", "V"]:
                     print(f"PD gain of joint {joint_name} were not defined, setting them to zero")
 
-        print(f"p_gains: {self.p_gains}")
-
-        self.commands = np.zeros((1, self.num_commands))
-        self.actions = torch.zeros(12)
-        self.last_actions = torch.zeros(12)
-        self.gravity_vector = np.zeros(3)
-        self.dof_pos = np.zeros(12)
-        self.dof_vel = np.zeros(12)
+        self.commands = np.zeros((1, self.num_commands), dtype=np.float32)
+        self.actions = torch.zeros(1, 12, dtype=torch.float32)
+        self.last_actions = torch.zeros_like(self.actions)
+        self.gravity_vector = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        self.dof_pos = self.default_dof_pos.copy()
+        self.dof_vel = np.zeros(12, dtype=np.float32)
+        self._state_snapshot = None
         self.body_linear_vel = np.zeros(3)
         self.body_angular_vel = np.zeros(3)
         self.joint_pos_target = np.zeros(12)
         self.joint_vel_target = np.zeros(12)
+        self.motor_pos_target = np.zeros(self.num_motors, dtype=np.float32)
         self.torques = np.zeros(12)
         self.contact_state = np.ones(4)
 
-        self.joint_idxs = self.se.joint_idxs
-
+        # Fixed training gait; these are independent of the three velocity commands.
+        self.gait_frequency = 3.0
+        self.gait_phase = 0.5
+        self.gait_offset = 0.0
+        self.gait_bound = 0.0
+        self.gait_duration = 0.5
         self.gait_indices = torch.zeros(self.num_envs, dtype=torch.float)
+        self.foot_indices = torch.zeros(self.num_envs, 4, dtype=torch.float)
         self.clock_inputs = torch.zeros(self.num_envs, 4, dtype=torch.float)
-
-        if "obs_scales" in self.cfg.keys():
-            self.obs_scales = self.cfg["obs_scales"]
-        else:
-            self.obs_scales = self.cfg["normalization"]["obs_scales"]
 
         self.is_currently_probing = False
 
     def set_probing(self, is_currently_probing):
         self.is_currently_probing = is_currently_probing
 
+    def lower_state_callback(self, state):
+        """Cache every DDS sample, with no printing throttle or motor commands.
+
+        The SDK quaternion is [w, x, y, z]. Treat it as the body-to-world
+        orientation, with IMU axes aligned to the policy's body axes.
+        """
+        quat = np.asarray(state.imu_state().quaternion(), dtype=np.float64)
+        if quat.shape != (4,) or not np.all(np.isfinite(quat)):
+            raise ValueError("IMU quaternion must contain four finite values in wxyz order")
+        norm = np.linalg.norm(quat)
+        if norm < 1e-8:
+            raise ValueError("IMU quaternion must have nonzero norm")
+        w, x, y, z = quat / norm
+        # R(body->world).T @ [0, 0, -1]: unit projected gravity, not acceleration.
+        gravity = np.array([
+            2 * (w * y - x * z),
+            -2 * (w * x + y * z),
+            2 * (x * x + y * y) - 1,
+        ], dtype=np.float32)
+        motors = state.motor_state()
+        dof_pos = np.array([motors[hw].q() for hw in ABS2HW], dtype=np.float32)
+        dof_pos -= MOTOR_OFFSET[ABS2HW]
+        dof_vel = np.array([motors[hw].dq() for hw in ABS2HW], dtype=np.float32)
+        if not np.all(np.isfinite(dof_pos)) or not np.all(np.isfinite(dof_vel)):
+            raise ValueError("Joint positions and velocities must be finite")
+        # Swap a complete sample so get_obs cannot mix two callback updates.
+        self._state_snapshot = (gravity, dof_pos, dof_vel)
+
+    def set_commands(self, vx, vy, yaw_rate):
+        """Set physical velocity commands when no command profile is supplied."""
+        self.commands[0] = (vx, vy, yaw_rate)
+
     def get_obs(self):
+        """Return float32 (1, 58): gravity, commands, q-q0, dq, a[-1], a[-2], clocks."""
+        snapshot = self._state_snapshot
+        if snapshot is not None:
+            self.gravity_vector, self.dof_pos, self.dof_vel = snapshot
+        elif self.se is not None:
+            self.gravity_vector = np.asarray(self.se.get_gravity_vector(), dtype=np.float32)
+            self.dof_pos = np.asarray(self.se.get_dof_pos(), dtype=np.float32)
+            self.dof_vel = np.asarray(self.se.get_dof_vel(), dtype=np.float32)
+        else:
+            raise RuntimeError("No LowerState received; register lower_state_callback and wait for feedback")
 
-        self.gravity_vector = self.se.get_gravity_vector()
-        cmds, reset_timer = self.command_profile.get_command(self.timestep * self.dt, probe=self.is_currently_probing)
-        self.commands[:, :] = cmds[:self.num_commands]
-        if reset_timer:
-            self.reset_gait_indices()
-        #else:
-        #    self.commands[:, 0:3] = self.command_profile.get_command(self.timestep * self.dt)[0:3]
-        self.dof_pos = self.se.get_dof_pos()
-        self.dof_vel = self.se.get_dof_vel()
-        self.body_linear_vel = self.se.get_body_linear_vel()
-        self.body_angular_vel = self.se.get_body_angular_vel()
+        if self.command_profile is not None:
+            cmds, reset_timer = self.command_profile.get_command(
+                self.timestep * self.dt, probe=self.is_currently_probing
+            )
+            cmds = torch.as_tensor(cmds).detach().cpu().numpy().reshape(-1)
+            if cmds.size < 3:
+                raise ValueError("Command profile must provide vx, vy, and yaw_rate")
+            self.commands[0] = cmds[:3]
+            if reset_timer:
+                self.reset_gait_indices()
 
-        ob = np.concatenate((self.gravity_vector.reshape(1, -1),
-                             self.commands * self.commands_scale,
-                             (self.dof_pos - self.default_dof_pos).reshape(1, -1) * self.obs_scales["dof_pos"],
-                             self.dof_vel.reshape(1, -1) * self.obs_scales["dof_vel"],
-                             torch.clip(self.actions, -self.cfg["normalization"]["clip_actions"],
-                                        self.cfg["normalization"]["clip_actions"]).cpu().detach().numpy().reshape(1, -1)
-                             ), axis=1)
+        clip_actions = self.cfg["normalization"]["clip_actions"]
+        ob = np.concatenate((
+            self.gravity_vector.reshape(1, 3),
+            (self.commands * self.commands_scale)[:, self.cmd_indices],
+            (self.dof_pos - self.default_dof_pos).reshape(1, 12) * self.obs_scales["dof_pos"],
+            self.dof_vel.reshape(1, 12) * self.obs_scales["dof_vel"],
+            self.actions.clamp(-clip_actions, clip_actions).detach().cpu().numpy().reshape(1, 12),
+            self.last_actions.clamp(-clip_actions, clip_actions).detach().cpu().numpy().reshape(1, 12),
+            self.clock_inputs.cpu().numpy(),
+        ), axis=1)
+        clip_obs = self.cfg["normalization"]["clip_observations"]
+        return torch.as_tensor(np.clip(ob, -clip_obs, clip_obs), dtype=torch.float32,
+                               device=self.device)
 
-        if self.cfg["env"]["observe_two_prev_actions"]:
-            ob = np.concatenate((ob,
-                            self.last_actions.cpu().detach().numpy().reshape(1, -1)), axis=1)
-
-        if self.cfg["env"]["observe_clock_inputs"]:
-            ob = np.concatenate((ob,
-                            self.clock_inputs), axis=1)
-            # print(self.clock_inputs)
-
-        if self.cfg["env"]["observe_vel"]:
-            ob = np.concatenate(
-                (self.body_linear_vel.reshape(1, -1) * self.obs_scales["lin_vel"],
-                 self.body_angular_vel.reshape(1, -1) * self.obs_scales["ang_vel"],
-                 ob), axis=1)
-
-        if self.cfg["env"]["observe_only_lin_vel"]:
-            ob = np.concatenate(
-                (self.body_linear_vel.reshape(1, -1) * self.obs_scales["lin_vel"],
-                 ob), axis=1)
-
-        if self.cfg["env"]["observe_yaw"]:
-            heading = self.se.get_yaw()
-            ob = np.concatenate((ob, heading.reshape(1, -1)), axis=-1)
-
-        self.contact_state = self.se.get_contact_state()
-        if "observe_contact_states" in self.cfg["env"].keys() and self.cfg["env"]["observe_contact_states"]:
-            ob = np.concatenate((ob, self.contact_state.reshape(1, -1)), axis=-1)
-
-        if "terrain" in self.cfg.keys() and self.cfg["terrain"]["measure_heights"]:
-            robot_height = 0.25
-            self.measured_heights = np.zeros(
-                (len(self.cfg["terrain"]["measured_points_x"]), len(self.cfg["terrain"]["measured_points_y"]))).reshape(
-                1, -1)
-            heights = np.clip(robot_height - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales["height_measurements"]
-            ob = np.concatenate((ob, heights), axis=1)
-
-
-        return torch.tensor(ob, device=self.device).float()
+    def get_observations(self):
+        return self.get_obs()
 
     def get_privileged_observations(self):
         return None
 
-    def publish_action(self, action, hard_reset=False):
+    def _prepare_action(self, action):
+        action = torch.as_tensor(action, dtype=torch.float32, device=self.device).detach()
+        if action.shape not in ((12,), (1, 12)):
+            raise ValueError("Policy action must have shape (12,) or (1, 12)")
+        if not torch.isfinite(action).all():
+            raise ValueError("Policy action must contain finite values")
+        clip_actions = self.cfg["normalization"]["clip_actions"]
+        return action.reshape(1, 12).clamp(-clip_actions, clip_actions)
 
-        command_for_robot = pd_tau_targets_lcmt()
-        self.joint_pos_target = \
-            (action[0, :12].detach().cpu().numpy() * self.cfg["control"]["action_scale"]).flatten()
+    def action_to_motor_targets(self, action):
+        """Scale 12 policy offsets and expand to 16 hardware position targets.
+
+        Hardware slots 3, 7, 11 and 15 are unused on the legged robot and stay zero.
+        This only builds targets; it does not publish or advance action history.
+        """
+        action = self._prepare_action(action).cpu().numpy().reshape(12)
+        self.joint_pos_target = action * self.cfg["control"]["action_scale"]
         self.joint_pos_target[[0, 3, 6, 9]] *= self.cfg["control"]["hip_scale_reduction"]
-        # self.joint_pos_target[[0, 3, 6, 9]] *= -1
-        self.joint_pos_target = self.joint_pos_target
         self.joint_pos_target += self.default_dof_pos
-        joint_pos_target = self.joint_pos_target[self.joint_idxs]
-        self.joint_vel_target = np.zeros(12)
-        # print(f'cjp {self.joint_pos_target}')
+        self.joint_vel_target = np.zeros(12, dtype=np.float32)
+        self.motor_pos_target = np.zeros(self.num_motors, dtype=np.float32)
+        self.motor_pos_target[ABS2HW] = self.joint_pos_target + MOTOR_OFFSET[ABS2HW]
+        return self.motor_pos_target.copy()
 
-        command_for_robot.q_des = joint_pos_target
-        command_for_robot.qd_des = self.joint_vel_target
-        command_for_robot.kp = self.p_gains
-        command_for_robot.kd = self.d_gains
-        command_for_robot.tau_ff = np.zeros(12)
-        command_for_robot.se_contactState = np.zeros(4)
-        command_for_robot.timestamp_us = int(time.time() * 10 ** 6)
-        command_for_robot.id = 0
+    def build_motor_command(self, action):
+        """Build a 16-slot Dobot LowerCmd without sending it to the robot."""
+        import dds_middleware_python as dds
 
+        targets = self.action_to_motor_targets(action)
+        kp = np.zeros(self.num_motors)
+        kd = np.zeros(self.num_motors)
+        kp[ABS2HW] = self.p_gains
+        kd[ABS2HW] = self.d_gains
+        cmd = dds.LowerCmd()
+        for hw in range(self.num_motors):
+            cmd[hw].mode(0)
+            cmd[hw].q(float(targets[hw]))
+            cmd[hw].dq(0.0)
+            cmd[hw].tau(0.0)
+            cmd[hw].kp(float(kp[hw]))
+            cmd[hw].kd(float(kd[hw]))
+        return cmd
+
+    def publish_action(self, action, hard_reset=False):
         if hard_reset:
-            command_for_robot.id = -1
-
-
-        self.torques = (self.joint_pos_target - self.dof_pos) * self.p_gains + (self.joint_vel_target - self.dof_vel) * self.d_gains
-        # 由lcm将神经网络输出的action传入c++ sdk
-        lc.publish("pd_plustau_targets", command_for_robot.encode())
+            raise NotImplementedError("Dobot LowerCmd does not support the legacy LCM hard_reset")
+        if self.middleware is None:
+            raise RuntimeError("Pass a DDS middleware with an rt/lower/cmd writer to publish actions")
+        cmd = self.build_motor_command(action)
+        self.middleware.publishLowerCmd(cmd)
+        self.torques = ((self.joint_pos_target - self.dof_pos) * self.p_gains
+                        + (self.joint_vel_target - self.dof_vel) * self.d_gains)
 
     def reset(self):
-        self.actions = torch.zeros(12)
+        self.actions.zero_()
+        self.last_actions.zero_()
+        self.reset_gait_indices()
         self.time = time.time()
         self.timestep = 0
         return self.get_obs()
 
+    def reset_idx(self, env_ids):
+        """Support HistoryWrapper's indexed reset for the single hardware robot."""
+        env_ids = torch.as_tensor(env_ids, device=self.device).reshape(-1)
+        if env_ids.numel() == 0:
+            return None
+        if torch.any(env_ids != 0):
+            raise ValueError("FakeEnvAgent has only one environment, with index 0")
+        return self.reset()
+
     def reset_gait_indices(self):
-        self.gait_indices = torch.zeros(self.num_envs, dtype=torch.float)
+        self.gait_indices.zero_()
+        self.foot_indices.zero_()
+        self.clock_inputs.zero_()
+
+    def _advance_gait(self):
+        """Advance once per policy step, before constructing its returned observation."""
+        self.gait_indices = torch.remainder(
+            self.gait_indices + self.dt * self.gait_frequency, 1.0
+        )
+        phase, offset, bound = self.gait_phase, self.gait_offset, self.gait_bound
+        foot_offsets = [phase + offset + bound, offset, bound, phase]
+        if self.cfg["commands"].get("pacing_offset", False):
+            foot_offsets[1], foot_offsets[2] = foot_offsets[2], foot_offsets[1]
+        self.foot_indices = torch.remainder(
+            self.gait_indices[:, None] + torch.tensor(foot_offsets, dtype=torch.float32), 1.0
+        )
+        duration = self.gait_duration
+        clock_phase = torch.where(
+            self.foot_indices < duration,
+            self.foot_indices * (0.5 / duration),
+            0.5 + (self.foot_indices - duration) * (0.5 / (1.0 - duration)),
+        )
+        self.clock_inputs = torch.sin(2 * torch.pi * clock_phase)
 
     def step(self, actions, hard_reset=False):
-        clip_actions = self.cfg["normalization"]["clip_actions"]
-        self.last_actions = self.actions[:]
-        self.actions = torch.clip(actions[0:1, :], -clip_actions, clip_actions)
-        self.publish_action(self.actions, hard_reset=hard_reset)
+        actions = self._prepare_action(actions)
+        self.publish_action(actions, hard_reset=hard_reset)
+        self.last_actions = self.actions.clone()
+        self.actions = actions
         time.sleep(max(self.dt - (time.time() - self.time), 0))
         if self.timestep % 100 == 0: print(f'frq: {1 / (time.time() - self.time)} Hz')
         self.time = time.time()
+        self.timestep += 1
+        self._advance_gait()
         obs = self.get_obs()
-
-        # clock accounting
-        frequencies = self.commands[:, 4]
-        phases = self.commands[:, 5]
-        offsets = self.commands[:, 6]
-        if self.num_commands == 8:
-            bounds = 0
-            durations = self.commands[:, 7]
-        else:
-            bounds = self.commands[:, 7]
-            durations = self.commands[:, 8]
-        self.gait_indices = torch.remainder(self.gait_indices + self.dt * frequencies, 1.0)
-
-        if "pacing_offset" in self.cfg["commands"] and self.cfg["commands"]["pacing_offset"]:
-            self.foot_indices = [self.gait_indices + phases + offsets + bounds,
-                                 self.gait_indices + bounds,
-                                 self.gait_indices + offsets,
-                                 self.gait_indices + phases]
-        else:
-            self.foot_indices = [self.gait_indices + phases + offsets + bounds,
-                                 self.gait_indices + offsets,
-                                 self.gait_indices + bounds,
-                                 self.gait_indices + phases]
-        self.clock_inputs[:, 0] = torch.sin(2 * np.pi * self.foot_indices[0])
-        self.clock_inputs[:, 1] = torch.sin(2 * np.pi * self.foot_indices[1])
-        self.clock_inputs[:, 2] = torch.sin(2 * np.pi * self.foot_indices[2])
-        self.clock_inputs[:, 3] = torch.sin(2 * np.pi * self.foot_indices[3])
-
-# 注释掉了下面camera相关代码
-# --------------------------------------------------------------------
-        # images = {'front': self.se.get_camera_front(),
-        #           'bottom': self.se.get_camera_bottom(),
-        #           'rear': self.se.get_camera_rear(),
-        #           'left': self.se.get_camera_left(),
-        #           'right': self.se.get_camera_right()
-        #           }
-        # downscale_factor = 2
-        # temporal_downscale = 3
-
-        # for k, v in images.items():
-        #     if images[k] is not None:
-        #         images[k] = cv2.resize(images[k], dsize=(images[k].shape[0]//downscale_factor, images[k].shape[1]//downscale_factor), interpolation=cv2.INTER_CUBIC)
-        #     if self.timestep % temporal_downscale != 0:
-        #         images[k] = None
-        #print(self.commands)
 
         infos = {"joint_pos": self.dof_pos[np.newaxis, :],
                  "joint_vel": self.dof_vel[np.newaxis, :],
                  "joint_pos_target": self.joint_pos_target[np.newaxis, :],
                  "joint_vel_target": self.joint_vel_target[np.newaxis, :],
+                 "motor_pos_target": self.motor_pos_target[np.newaxis, :],
                  "body_linear_vel": self.body_linear_vel[np.newaxis, :],
                  "body_angular_vel": self.body_angular_vel[np.newaxis, :],
                  "contact_state": self.contact_state[np.newaxis, :],
@@ -293,13 +350,6 @@ class LCMAgent():
                  "body_linear_vel_cmd": self.commands[:, 0:2],
                  "body_angular_vel_cmd": self.commands[:, 2:],
                  "privileged_obs": None,
-                #  -------------------------------------------
-                #  "camera_image_front": images['front'],
-                #  "camera_image_bottom": images['bottom'],
-                #  "camera_image_rear": images['rear'],
-                #  "camera_image_left": images['left'],
-                #  "camera_image_right": images['right'],
                  }
 
-        self.timestep += 1
         return obs, None, None, infos
